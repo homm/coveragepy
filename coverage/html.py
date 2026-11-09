@@ -374,7 +374,7 @@ class HtmlReporter:
         for fr, analysis in get_analysis_to_report(self.coverage, morfs):
             have_data = True
             ftr = FileToReport(fr, analysis)
-            if self.should_report(analysis, self.index_pages["file"]):
+            if self.should_report(analysis.numbers, self.index_pages["file"]):
                 files_to_report.append(ftr)
             else:
                 file_be_gone(os.path.join(self.directory, ftr.html_filename))
@@ -446,10 +446,8 @@ class HtmlReporter:
             with open(os.path.join(self.directory, ".gitignore"), "w", encoding="utf-8") as fgi:
                 fgi.write("# Created by coverage.py\n*\n")
 
-    def should_report(self, analysis: Analysis, index_page: IndexPage) -> bool:
-        """Determine if we'll report this file or region."""
-        # Get the numbers for this file.
-        nums = analysis.numbers
+    def should_report(self, nums: Numbers, index_page: IndexPage) -> bool:
+        """Add to the index totals and determine if the file or region is shown."""
         index_page.totals += nums
 
         if self.skip_covered:
@@ -588,61 +586,54 @@ class HtmlReporter:
     def write_region_index_pages(self, files_to_report: Iterable[FileToReport]) -> None:
         """Write the other index pages for this report."""
         for ftr in files_to_report:
-            region_nouns = [pair[0] for pair in ftr.fr.code_region_kinds()]
-            num_lines = len(ftr.fr.source().splitlines())
-            regions = ftr.fr.code_regions()
-
-            for noun in region_nouns:
+            for noun, summaries in self.region_summaries(ftr).items():
                 page_data = self.index_pages[noun]
-
-                outside_lines = set(range(1, num_lines + 1))
-                for region in regions:
-                    if region.kind != noun:
+                for name, start, nums in summaries:
+                    if not self.should_report(nums, page_data):
                         continue
-                    outside_lines -= region.lines
-
-                narrower = AnalysisNarrower(ftr.analysis)
-                narrower.add_regions(r.lines for r in regions if r.kind == noun)
-                narrower.add_regions([outside_lines])
-
-                for region in regions:
-                    if region.kind != noun:
-                        continue
-                    analysis = narrower.narrow(region.lines)
-                    if not self.should_report(analysis, page_data):
-                        continue
-                    sorting_name = region.name.rpartition(".")[-1].lstrip("_")
-                    page_data.summaries.append(
-                        IndexItem(
-                            url=f"{ftr.html_filename}#t{region.start}",
-                            file=ftr.fr.relative_filename(),
-                            description=(
-                                f"<data value='{escape(sorting_name)}'>"
-                                + escape(region.name)
-                                + "</data>"
-                            ),
-                            nums=analysis.numbers,
+                    if name is None:
+                        url = ftr.html_filename
+                        description = (
+                            "<data value=''>"
+                            f"<span class='no-noun'>(no {escape(noun)})</span></data>"
                         )
-                    )
-
-                analysis = narrower.narrow(outside_lines)
-                if self.should_report(analysis, page_data):
+                    else:
+                        url = f"{ftr.html_filename}#t{start}"
+                        sorting_name = name.rpartition(".")[-1].lstrip("_")
+                        description = f"<data value='{escape(sorting_name)}'>{escape(name)}</data>"
                     page_data.summaries.append(
                         IndexItem(
-                            url=ftr.html_filename,
+                            url=url,
                             file=ftr.fr.relative_filename(),
-                            description=(
-                                "<data value=''>"
-                                + f"<span class='no-noun'>(no {escape(noun)})</span>"
-                                + "</data>"
-                            ),
-                            nums=analysis.numbers,
+                            description=description,
+                            nums=nums,
                         )
                     )
 
         for noun, index_page in self.index_pages.items():
             if noun != "file":
                 self.write_index_page(index_page)
+
+    def region_summaries(self, ftr: FileToReport) -> dict[str, list[RegionSummary]]:
+        """Compute the anchors and counts needed for the region indexes."""
+        result = {}
+        num_lines = len(ftr.fr.source().splitlines())
+        regions = list(ftr.fr.code_regions())
+        for noun, _ in ftr.fr.code_region_kinds():
+            outside_lines = set(range(1, num_lines + 1))
+            entries: list[tuple[str | None, int | None, set[TLineNo]]] = []
+            for region in regions:
+                if region.kind == noun:
+                    outside_lines -= region.lines
+                    entries.append((region.name, region.start, region.lines))
+            entries.append((None, None, outside_lines))
+            narrower = AnalysisNarrower(ftr.analysis)
+            narrower.add_regions(lines for _, _, lines in entries)
+            summaries = []
+            for name, start, lines in entries:
+                summaries.append((name, start, narrower.narrow(lines).numbers))
+            result[noun] = summaries
+        return result
 
     def write_index_page(self, index_page: IndexPage, **kwargs: str) -> str:
         """Write an index page specified by `index_page`.
@@ -683,6 +674,9 @@ class HtmlReporter:
         index_file = os.path.join(self.directory, index_page.filename)
         write_html(index_file, html)
         return index_file
+
+
+RegionSummary = tuple[str | None, int | None, Numbers]
 
 
 @dataclass
