@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections
 import datetime
 import glob
+import gzip
 import json
 import os
 import os.path
@@ -15,6 +16,7 @@ import re
 import sys
 from contextlib import chdir
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import IO, Any
 from unittest import mock
 
@@ -272,6 +274,99 @@ class HtmlDeltaTest(HtmlTestHelpers, CoverageTest):
         self.run_coverage()
         self.assert_htmlcov_files_exist()
 
+    def test_unchanged_files_rebuild_region_indexes_without_parsing(self) -> None:
+        self.create_initial_files()
+        self.run_coverage()
+        for noun in ("function", "class"):
+            Path(f"htmlcov/{noun}_index.html").unlink()
+
+        with mock.patch("coverage.parser.PythonParser.parse_source", side_effect=AssertionError):
+            self.run_coverage()
+
+        self.assert_htmlcov_files_exist()
+        assert "func1" in Path("htmlcov/function_index.html").read_text(encoding="utf-8")
+        assert "htmlcov/helper1_py.html" not in self.files_written
+
+    def test_deleted_source_page_is_recreated(self) -> None:
+        self.create_initial_files()
+        self.run_coverage()
+        Path("htmlcov/helper1_py.html").unlink()
+
+        self.run_coverage()
+
+        self.assert_htmlcov_files_exist()
+        assert "htmlcov/helper1_py.html" in self.files_written
+        assert "htmlcov/helper2_py.html" not in self.files_written
+
+    def test_missing_source_after_cached_report(self) -> None:
+        self.make_file("example.py", "x = 1\n")
+        cov = Coverage(config_file=False, data_file=None)
+        cov.get_data().add_lines({abs_file("example.py"): {1}})
+        assert cov.html_report() == 100
+
+        Path("example.py").unlink()
+        with pytest.raises(NoSource, match="No source for code: .*example.py"):
+            cov.html_report()
+
+    def test_branch_report_includes_file_without_arcs(self) -> None:
+        self.make_file("example.py", "x = 1\n")
+        cov = Coverage(config_file=False, data_file=None)
+        data = cov.get_data()
+        data.add_arcs({})
+        data.touch_file(abs_file("example.py"))
+
+        assert cov.html_report() == 0
+        assert '<p class="mis show_mis">' in self.get_html_report_content("example.py")
+
+    @pytest.mark.parametrize("missing", ["regions", "class"])
+    def test_incomplete_region_cache_rebuilds_report(self, missing: str) -> None:
+        self.create_initial_files()
+        self.run_coverage()
+        status_path = Path("htmlcov/status.json.gz")
+        with gzip.open(status_path, "rt", encoding="utf-8") as status_file:
+            status = json.load(status_file)
+        cached = status["files"]["helper1_py"]
+        if missing == "regions":
+            del cached["regions"]
+        else:
+            del cached["regions"][missing]
+        with gzip.open(status_path, "wt", encoding="utf-8") as status_file:
+            json.dump(status, status_file)
+
+        self.run_coverage()
+
+        self.assert_htmlcov_files_exist()
+        assert "func1" in Path("htmlcov/function_index.html").read_text(encoding="utf-8")
+        assert "htmlcov/helper1_py.html" in self.files_written
+        assert "htmlcov/helper2_py.html" not in self.files_written
+
+    def test_context_labels_invalidate_page_with_same_covered_lines(self) -> None:
+        self.make_file("example.py", "x = 1\n")
+        for label in ("first-test", "second-test"):
+            cov = Coverage(config_file=False, data_file=None)
+            data = cov.get_data()
+            data.set_context(label)
+            data.add_lines({abs_file("example.py"): {1}})
+            cov.html_report(show_contexts=True)
+
+        page = self.get_html_report_content("example.py")
+        assert "second-test" in page
+        assert "first-test" not in page
+
+    def test_arc_change_invalidates_page_with_same_covered_lines(self) -> None:
+        self.make_file("example.py", "if cond:\n    x = 1\nelse:\n    x = 2\ny = x\n")
+        arcs = {(-1, 1), (1, 2), (2, 5), (4, 5), (5, -1)}
+        cov = Coverage(config_file=False, data_file=None)
+        data = cov.get_data()
+        data.add_arcs({abs_file("example.py"): arcs})
+        before = cov.html_report()
+        partial_line = '<p class="par run show_par">'
+        assert partial_line in self.get_html_report_content("example.py")
+        data.add_arcs({abs_file("example.py"): {(1, 4)}})
+
+        assert before < cov.html_report()
+        assert partial_line not in self.get_html_report_content("example.py")
+
     def test_html_delta_from_source_change(self) -> None:
         # HTML generation can create only the files that have changed.
         # In this case, helper1 changes because its source is different.
@@ -438,12 +533,12 @@ class HtmlDeltaTest(HtmlTestHelpers, CoverageTest):
         self.create_initial_files()
         self.run_coverage()
 
-        with open("htmlcov/status.json", encoding="utf-8") as status_json:
+        with gzip.open("htmlcov/status.json.gz", "rt", encoding="utf-8") as status_json:
             status_data = json.load(status_json)
 
-        assert status_data["format"] == 5
-        status_data["format"] = 99
-        with open("htmlcov/status.json", "w", encoding="utf-8") as status_json:
+        assert status_data["format"] == 6
+        status_data["format"] = 5
+        with gzip.open("htmlcov/status.json.gz", "wt", encoding="utf-8") as status_json:
             json.dump(status_data, status_json)
 
         self.run_coverage()
@@ -454,6 +549,27 @@ class HtmlDeltaTest(HtmlTestHelpers, CoverageTest):
         assert "htmlcov/helper1_py.html" in self.files_written
         assert "htmlcov/helper2_py.html" in self.files_written
         assert "htmlcov/main_file_py.html" in self.files_written
+
+    @pytest.mark.parametrize("damage", ["truncated", "invalid_block"])
+    def test_corrupted_gzip_status_rebuilds_report(self, damage: str) -> None:
+        self.create_initial_files()
+        self.run_coverage()
+        status_path = Path("htmlcov/status.json.gz")
+        status = status_path.read_bytes()
+        if damage == "truncated":
+            status_path.write_bytes(status[:-1])
+        else:
+            status = gzip.compress(gzip.decompress(status), mtime=0)
+            # Set the first DEFLATE block type to the reserved value.
+            status_path.write_bytes(status[:10] + b"\xff" + status[11:])
+
+        self.run_coverage()
+
+        self.assert_htmlcov_files_exist()
+        assert "htmlcov/helper1_py.html" in self.files_written
+        assert "htmlcov/helper2_py.html" in self.files_written
+        assert "htmlcov/main_file_py.html" in self.files_written
+        assert json.loads(gzip.decompress(status_path.read_bytes()))["format"] == 6
 
     def test_dont_overwrite_gitignore(self) -> None:
         self.create_initial_files()
