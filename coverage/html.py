@@ -40,7 +40,7 @@ from coverage.misc import (
     plural,
     stdout_link,
 )
-from coverage.numbits import nums_to_numbits
+from coverage.numbits import numbits_union
 from coverage.python import PythonFileReporter
 from coverage.report_core import analyze_file, get_files_to_report
 from coverage.results import Analysis, AnalysisNarrower, Numbers
@@ -504,7 +504,8 @@ class HtmlReporter:
                     update_arc_hash(pack_arc(start, end))
                 arc_digest = arc_hash.hexdigest()[:32]
         else:
-            bits = nums_to_numbits(self.data.lines(filename) or ())
+            bitmaps = self.data._line_bitmaps(filename) or []
+            bits = functools.reduce(numbits_union, bitmaps) if bitmaps else b""
             line_bitmap = base64.b64encode(bits.rstrip(b"\0")).decode("ascii")
         signature = [
             source_hash.hexdigest(),
